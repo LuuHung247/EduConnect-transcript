@@ -43,47 +43,30 @@ async def upload_thumbnail(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@router.post('/api/upload/video')
+@router.post("/api/upload/video")
 async def upload_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user_id: str = Form(...),
-    create_transcript: bool = Form(True)
+    create_transcript: str = Form("true"),
+    lesson_id: str = Form(""),
+    series_id: str = Form("")
 ):
-    """
-    Upload video file with optional transcript generation
+    """Upload video và queue transcript generation"""
+    storage = StorageService()
     
-    Args:
-        file: Video file
-        user_id: User ID
-        create_transcript: Generate transcript in background (default: True)
+    should_create_transcript = create_transcript.lower() == "true"
     
-    Returns:
-        {
-            "success": true,
-            "url": "s3://...",
-            "key": "files/user-123/videos/...",
-            "transcript_status": "processing" | "disabled"
-        }
-    """
-    try:
-        result = await storage_service.upload_video(
-            file=file,
-            user_id=user_id,
-            background_tasks=background_tasks,
-            create_transcript=create_transcript
-        )
-        
-        return {
-            "success": True,
-            "url": result['url'],
-            "key": result['key'],
-            "transcript_status": result.get('transcript_status', 'disabled')
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await storage.upload_video(
+        file=file,
+        user_id=user_id,
+        background_tasks=background_tasks if should_create_transcript else None,
+        create_transcript=should_create_transcript,
+        lesson_id=lesson_id if lesson_id else None,
+        series_id=series_id if series_id else None
+    )
+    
+    return result
 
 
 @router.post('/api/upload/document')

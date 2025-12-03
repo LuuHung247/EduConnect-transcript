@@ -1,5 +1,5 @@
 from uuid import uuid4
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 from fastapi import UploadFile, BackgroundTasks
 from pathlib import Path
 import tempfile
@@ -7,7 +7,9 @@ import os
 import logging
 from faster_whisper import WhisperModel
 import torch
-
+from bson import ObjectId
+from app.utils.mongodb import get_db
+from datetime import datetime, timezone
 from app.utils.s3 import upload_to_s3, delete_from_s3
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,10 @@ class StorageService:
         file: UploadFile, 
         user_id: str,
         background_tasks: Optional[BackgroundTasks] = None,
-        create_transcript: bool = True
+        create_transcript: bool = True,
+        # Callback info để update DB sau khi transcript xong
+        lesson_id: Optional[str] = None,
+        series_id: Optional[str] = None
     ) -> Dict[str, str]:
         """
         Upload video file and optionally create transcript in background
@@ -69,6 +74,8 @@ class StorageService:
             user_id: User ID
             background_tasks: FastAPI BackgroundTasks for async processing
             create_transcript: Whether to create transcript (default: True)
+            lesson_id: Lesson ID để update transcript URL sau
+            series_id: Series ID để update transcript URL sau
         
         Returns:
             Dict with url, key, and transcript_status
@@ -94,34 +101,36 @@ class StorageService:
         }
         
         # Add transcript task to background if requested
-        if create_transcript and background_tasks:
+        if create_transcript and background_tasks and lesson_id and series_id:
             background_tasks.add_task(
-                self._create_and_upload_transcript,
+                self._create_transcript_and_update_lesson,
                 buffer=buffer,
                 video_filename=filename,
                 user_id=user_id,
-                video_url=url
+                lesson_id=lesson_id,
+                series_id=series_id
             )
             result["transcript_status"] = "processing"
             logger.info(f"✅ Video uploaded: {video_key}")
-            logger.info(f"🔄 Transcript generation queued for: {filename}")
+            logger.info(f"🔄 Transcript generation queued for lesson: {lesson_id}")
+        elif create_transcript and not (lesson_id and series_id):
+            logger.warning("⚠️ Transcript requested but lesson_id/series_id not provided")
+            result["transcript_status"] = "skipped"
         
         return result
     
-    async def _create_and_upload_transcript(
+    def _create_transcript_and_update_lesson(
         self,
         buffer: bytes,
         video_filename: str,
         user_id: str,
-        video_url: str
+        lesson_id: str,
+        series_id: str
     ):
         """
-        Background task: Create transcript from video and upload to S3
-        
-        This runs asynchronously after video upload completes
+        Background task: Create transcript từ video, upload S3, và update lesson trong DB
         """
         temp_video_path = None
-        temp_transcript_path = None
         
         try:
             # Save video to temporary file
@@ -129,7 +138,7 @@ class StorageService:
                 temp_video.write(buffer)
                 temp_video_path = temp_video.name
             
-            logger.info(f"🎬 Starting transcription for: {video_filename}")
+            logger.info(f"🎬 Starting transcription for lesson: {lesson_id}")
             
             # Generate transcript
             model = get_whisper_model()
@@ -147,28 +156,15 @@ class StorageService:
             )
             
             # Collect segments
-            segments = []
             full_text = []
-            
             for segment in segments_generator:
-                segments.append({
-                    'start': round(segment.start, 2),
-                    'end': round(segment.end, 2),
-                    'text': segment.text.strip()
-                })
                 full_text.append(segment.text.strip())
             
             transcript_text = ' '.join(full_text)
             
-            # Save transcript to temporary file
-            transcript_filename = f"{Path(video_filename).stem}_transcript.txt"
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_transcript:
-                temp_transcript.write(transcript_text)
-                temp_transcript_path = temp_transcript.name
-            
             # Upload transcript to S3
-            with open(temp_transcript_path, 'rb') as f:
-                transcript_buffer = f.read()
+            transcript_filename = f"{Path(video_filename).stem}_transcript.txt"
+            transcript_buffer = transcript_text.encode('utf-8')
             
             transcript_url = upload_to_s3(
                 buffer=transcript_buffer,
@@ -177,31 +173,57 @@ class StorageService:
                 prefix=f"files/user-{user_id}/transcripts"
             )
             
-            transcript_key = f"files/user-{user_id}/transcripts/{transcript_filename}"
-            
-            logger.info(f"✅ Transcript uploaded: {transcript_key}")
+            logger.info(f"✅ Transcript uploaded: {transcript_url}")
             logger.info(f"   Language: {info.language} ({info.language_probability:.2%})")
             logger.info(f"   Duration: {info.duration:.2f}s")
-            logger.info(f"   Segments: {len(segments)}")
             
-            # TODO: Optionally update database with transcript info
-            # You can call an API or update DB here with:
-            # - video_url
-            # - transcript_url
-            # - transcript_key
-            # - language
-            # - segments
+            # Update lesson trong DB
+            self._update_lesson_transcript(lesson_id, series_id, transcript_url)
+            
+            logger.info(f"✅ Lesson {lesson_id} updated with transcript")
             
         except Exception as e:
-            logger.error(f"❌ Transcript generation failed for {video_filename}: {str(e)}")
-            # TODO: Optionally notify user or update status in database
+            logger.error(f"❌ Transcript generation failed for lesson {lesson_id}: {str(e)}")
+            # Optionally: Update lesson với error status
+            self._update_lesson_transcript_error(lesson_id, series_id, str(e))
         
         finally:
             # Cleanup temporary files
             if temp_video_path and os.path.exists(temp_video_path):
                 os.unlink(temp_video_path)
-            if temp_transcript_path and os.path.exists(temp_transcript_path):
-                os.unlink(temp_transcript_path)
+    
+    def _update_lesson_transcript(self, lesson_id: str, series_id: str, transcript_url: str):
+        """Update lesson với transcript URL"""
+
+        
+        _, db = get_db()
+        db["lessons"].update_one(
+            {"_id": ObjectId(lesson_id), "lesson_serie": series_id},
+            {
+                "$set": {
+                    "lesson_transcript": transcript_url,
+                    "transcript_status": "completed",
+                    "updatedAt":datetime.now(timezone.utc).isoformat() # MongoDB sẽ set timestamp nếu có middleware
+                }
+            }
+        )
+    
+    def _update_lesson_transcript_error(self, lesson_id: str, series_id: str, error: str):
+        """Update lesson với transcript error status"""
+        from bson import ObjectId
+        from app.utils.mongodb import get_db
+        
+        _, db = get_db()
+        db["lessons"].update_one(
+            {"_id": ObjectId(lesson_id), "lesson_serie": series_id},
+            {
+                "$set": {
+                    "transcript_status": "failed",
+                    "transcript_error": error,
+                    "updatedAt": None
+                }
+            }
+        )
     
     async def upload_document(self, file: UploadFile, user_id: str) -> Dict[str, str]:
         """Upload document file"""
@@ -239,6 +261,24 @@ class StorageService:
                 })
         
         return results
+    
+    async def upload_transcript(self, file: UploadFile, user_id: str) -> Dict[str, str]:
+        """Upload transcript file manually"""
+        filename = f"{uuid4()}_{file.filename}"
+        content_type = file.content_type or 'text/plain'
+        buffer = await file.read()
+        
+        url = upload_to_s3(
+            buffer=buffer,
+            key=filename,
+            content_type=content_type,
+            prefix=f"files/user-{user_id}/transcripts"
+        )
+        
+        return {
+            "url": url,
+            "key": f"files/user-{user_id}/transcripts/{filename}"
+        }
     
     def delete_file(self, url_or_key: str) -> bool:
         """Delete a file from S3"""
