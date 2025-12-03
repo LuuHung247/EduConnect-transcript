@@ -6,9 +6,8 @@ aiofiles
 python-multipart
 pydantic
 torch
-torchvision
-torchaudio
 faster-whisper
 numpy
 tqdm
 requests
+pymongo
