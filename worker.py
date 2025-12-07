@@ -1,9 +1,14 @@
 import os
 import sys
 import logging
+import time
+import random
 from pathlib import Path
 from datetime import datetime, timezone
+
 import google.generativeai as genai
+# Import thêm bộ xử lý lỗi của Google
+from google.api_core import exceptions as google_exceptions
 
 # Setup logging
 logging.basicConfig(
@@ -28,18 +33,15 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 
 def init_gemini():
-    """Initialize Gemini API"""
     if not GEMINI_API_KEY:
         logger.warning("⚠️ GEMINI_API_KEY not configured, summary will be skipped")
         return False
-    
     genai.configure(api_key=GEMINI_API_KEY)
     logger.info("✅ Gemini API initialized")
     return True
 
 
 def get_whisper_model():
-    """Lazy load Whisper model"""
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
         import torch
@@ -49,142 +51,122 @@ def get_whisper_model():
         compute_type = "float16" if device == "cuda" else "int8"
         
         logger.info(f"🔄 Loading Whisper model on {device}...")
-        _WHISPER_MODEL = WhisperModel(
-            "small",
-            device=device,
-            compute_type=compute_type,
-            num_workers=1
-        )
+        _WHISPER_MODEL = WhisperModel("small", device=device, compute_type=compute_type, num_workers=1)
         logger.info("✅ Whisper model loaded")
     return _WHISPER_MODEL
 
 
-def generate_summary(transcript_text: str) -> str:
+def format_timestamp(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    remaining_seconds = int(seconds % 60)
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def get_gemini_model():
+    generation_config = {
+        "temperature": 0.3, 
+        "top_p": 0.8,
+        "top_k": 40,
+        "max_output_tokens": 8192,
+    }
+    # QUAN TRỌNG: Đổi sang gemini-1.5-flash để ổn định hơn bản 2.0 preview
+    return genai.GenerativeModel(
+        model_name='gemini-2.5-flash', 
+        generation_config=generation_config
+    )
+
+# --- HÀM RETRY MẠNH MẼ HƠN ---
+def call_gemini_retry(prompt: str, max_retries=5, base_delay=10):
     """
-    Generate structured lesson notes in English using Gemini API.
-    Removes icons and forces English output to prevent font issues.
+    Gọi Gemini với cơ chế backoff mạnh mẽ.
     """
-    if not GEMINI_API_KEY:
-        logger.error("Gemini API Key is missing.")
-        return ""
+    if not GEMINI_API_KEY: return ""
     
-    try:
-        logger.info("Generating structured notes with Gemini...")
-        
-        # Cấu hình model: Temperature thấp để đảm bảo tính chính xác
-        generation_config = {
-            "temperature": 0.3, 
-            "top_p": 0.8,
-            "top_k": 40,
-            "max_output_tokens": 2048,
-        }
+    model = get_gemini_model()
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            if response.parts:
+                return response.text.strip()
+            return ""
+            
+        except google_exceptions.ResourceExhausted as e:
+            # Bắt đúng lỗi Quota (429) của Google
+            wait_time = base_delay * (attempt + 1) + random.uniform(2, 5)
+            logger.warning(f"⚠️ Hết Quota (429). Đang chờ {wait_time:.1f}s để thử lại lần {attempt+1}/{max_retries}...")
+            time.sleep(wait_time)
+            
+        except Exception as e:
+            # Các lỗi khác (429 dạng string hoặc lỗi mạng)
+            error_msg = str(e).lower()
+            if "429" in error_msg or "quota" in error_msg or "resource exhausted" in error_msg:
+                wait_time = base_delay * (attempt + 1) + random.uniform(2, 5)
+                logger.warning(f"⚠️ Lỗi Quota (Generic). Đang chờ {wait_time:.1f}s để thử lại lần {attempt+1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Lỗi không thể thử lại: {e}")
+                return ""
+                
+    logger.error("❌ Thất bại sau nhiều lần thử lại (Hết quota trong ngày hoặc mạng quá yếu).")
+    return ""
 
-        model = genai.GenerativeModel(
-            model_name='gemini-2.0-flash',
-            generation_config=generation_config
-        )
-        
-        # Prompt được tối ưu cho đầu ra tiếng Anh, không icon
-        prompt = f"""
-You are an expert educational content summarizer and note-taker. 
-Your task is to process the following raw video transcript into high-quality, structured study notes in ENGLISH.
 
+def generate_overall_summary(transcript_text: str) -> str:
+    prompt = f"""
+You are an expert summarizer. Create a HIGH-LEVEL EXECUTIVE SUMMARY.
 INPUT TRANSCRIPT:
 \"\"\"
 {transcript_text}
 \"\"\"
-
-INSTRUCTIONS:
-1. Language: The final output must be strictly in ENGLISH, regardless of the input language.
-2. Formatting: Use standard Markdown. Do NOT use emojis or special unicode characters (like icons) that might cause font rendering issues.
-3. Quality Control: Remove filler words, verbal tics, and repetitive phrasing. Focus on the core educational value.
-
-OUTPUT STRUCTURE (Follow this strictly):
-
-# Lesson Title
-[Create a concise, descriptive title]
-
-## Executive Summary
-[Provide a 2-3 sentence high-level overview of the entire lesson. What is the main problem and solution?]
-
-## Key Concepts & Details
-[Use hierarchical bullet points. Bold key terms.]
-- Concept 1:
-  - Explanation or details...
-  - Example...
-- Concept 2:
-  - Explanation or details...
-
-## Terminology (If applicable)
-[Create a Markdown table for technical terms]
-| Term | Definition |
-|------|------------|
-| ...  | ...        |
-
+OUTPUT FORMAT (Markdown):
+# Video Summary
+[2-3 paragraphs]
 ## Key Takeaways
-[List actionable advice, warnings, or conclusions]
-- ...
-- ...
-
+- [Point 1]
+- [Point 2]
 """
-
-        response = model.generate_content(prompt)
-        
-        if not response.parts:
-            logger.warning("Gemini generated empty response.")
-            return "Error: Could not generate summary."
-
-        summary = response.text.strip()
-        
-        logger.info(f"Summary generated ({len(summary)} chars)")
-        return summary
-        
-    except Exception as e:
-        logger.error(f"Failed to generate summary: {e}")
-        return ""
+    return call_gemini_retry(prompt)
 
 
-def update_lesson_success(
-    lesson_id: str, 
-    series_id: str, 
-    transcript_url: str,
-    summary_url: str = ""
-):
-    """Update lesson với transcript URL và summary URL"""
+def generate_timeline_summary(transcript_with_timestamps: str) -> str:
+    prompt = f"""
+You are a video chapter generator. Group transcript segments into LOGICAL CHAPTERS.
+INPUT TRANSCRIPT (with timestamps):
+\"\"\"
+{transcript_with_timestamps}
+\"\"\"
+OUTPUT FORMAT (Markdown):
+## Timeline & Topics
+**[Start] - [End] : [Topic Name]**
+> [Summary]
+"""
+    return call_gemini_retry(prompt)
+
+
+def update_lesson_success(lesson_id, series_id, transcript_url, summary_url="", timeline_url=""):
     _, db = get_db()
-    
     update_data = {
         "lesson_transcript": transcript_url,
         "transcript_status": "completed",
         "updatedAt": datetime.now(timezone.utc)
     }
-    
-    if summary_url:
-        update_data["lesson_summary"] = summary_url
+    if summary_url: update_data["lesson_summary"] = summary_url
+    if timeline_url: update_data["lesson_timeline"] = timeline_url
     
     db["lessons"].update_one(
         {"_id": ObjectId(lesson_id), "lesson_serie": series_id},
         {"$set": update_data}
     )
 
-
-def update_lesson_error(lesson_id: str, series_id: str, error: str):
-    """Update lesson với error status"""
+def update_lesson_error(lesson_id, series_id, error):
     _, db = get_db()
     db["lessons"].update_one(
         {"_id": ObjectId(lesson_id), "lesson_serie": series_id},
-        {
-            "$set": {
-                "transcript_status": "failed",
-                "transcript_error": error,
-                "updatedAt": datetime.now(timezone.utc)
-            }
-        }
+        {"$set": {"transcript_status": "failed", "transcript_error": error, "updatedAt": datetime.now(timezone.utc)}}
     )
 
-
 def process_job(job_data: dict) -> bool:
-    """Process single transcript job"""
     video_path = job_data['video_path']
     user_id = job_data['user_id']
     lesson_id = job_data['lesson_id']
@@ -192,142 +174,74 @@ def process_job(job_data: dict) -> bool:
     filename = job_data.get('filename', Path(video_path).name)
     
     try:
-        logger.info(f"🎬 Processing transcript for lesson: {lesson_id}")
-        logger.info(f"   Video: {video_path}")
+        logger.info(f"🎬 Processing lesson: {lesson_id}")
+        if not os.path.exists(video_path): raise FileNotFoundError(f"Video file not found")
         
-        # Check file exists
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-        
-        # ===== Step 1: Transcribe =====
+        # 1. Transcribe
         model = get_whisper_model()
-        segments_generator, info = model.transcribe(
-            video_path,
-            language=None,
-            beam_size=1,
-            best_of=1,
-            temperature=0,
-            vad_filter=True,
-            vad_parameters={
-                "threshold": 0.5,
-                "min_speech_duration_ms": 250,
-            },
-        )
+        segments_generator, info = model.transcribe(video_path, beam_size=1, temperature=0, vad_filter=True)
         
-        # Collect text
-        full_text = []
+        full_text_clean = []
+        full_text_timed = []
         for segment in segments_generator:
-            full_text.append(segment.text.strip())
+            ts = format_timestamp(segment.start)
+            txt = segment.text.strip()
+            full_text_clean.append(txt)
+            full_text_timed.append(f"[{ts}] {txt}")
         
-        transcript_text = ' '.join(full_text)
+        clean_str = ' '.join(full_text_clean)
+        timed_str = '\n'.join(full_text_timed)
         
-        logger.info(f"✅ Transcription complete")
-        logger.info(f"   Language: {info.language} ({info.language_probability:.2%})")
-        logger.info(f"   Duration: {info.duration:.2f}s")
-        logger.info(f"   Text length: {len(transcript_text)} chars")
+        logger.info(f"✅ Transcribed ({info.duration:.2f}s)")
         
-        # ===== Step 2: Upload transcript to S3 =====
-        transcript_filename = f"{Path(filename).stem}_transcript.txt"
-        transcript_url = upload_to_s3(
-            buffer=transcript_text.encode('utf-8'),
-            key=transcript_filename,
-            content_type='text/plain',
-            prefix=f"files/user-{user_id}/transcripts"
-        )
-        logger.info(f"✅ Transcript uploaded: {transcript_url}")
+        # 2. Upload Transcript
+        transcript_url = upload_to_s3(clean_str.encode('utf-8'), f"{Path(filename).stem}_transcript.txt", 'text/plain', f"files/user-{user_id}/transcripts")
         
-        # ===== Step 3: Generate summary with Gemini =====
+        # 3. AI Generation
         summary_url = ""
-        if transcript_text and len(transcript_text) > 50:  # Chỉ tóm tắt nếu có nội dung
-            summary_text = generate_summary(transcript_text)
+        timeline_url = ""
+        
+        if len(clean_str) > 50:
+            # Task 1: Overall Summary
+            logger.info("🤖 Generating Overall Summary...")
+            summary_content = generate_overall_summary(clean_str)
+            if summary_content:
+                summary_url = upload_to_s3(summary_content.encode('utf-8'), f"{Path(filename).stem}_summary.txt", 'text/plain', f"files/user-{user_id}/summaries")
             
-            if summary_text:
-                # Upload summary to S3
-                summary_filename = f"{Path(filename).stem}_summary.txt"
-                summary_url = upload_to_s3(
-                    buffer=summary_text.encode('utf-8'),
-                    key=summary_filename,
-                    content_type='text/plain',
-                    prefix=f"files/user-{user_id}/summaries"
-                )
-                logger.info(f"✅ Summary uploaded: {summary_url}")
-        
-        # ===== Step 4: Update DB =====
-        update_lesson_success(lesson_id, series_id, transcript_url, summary_url)
-        logger.info(f"✅ Lesson {lesson_id} updated with transcript and summary")
-        
+            # --- QUAN TRỌNG: Sleep dài hơn để né rate limit ---
+            if summary_content:
+                logger.info("⏳ Đang nghỉ 15 giây để hồi phục Quota API...")
+                time.sleep(15) 
+
+            # Task 2: Timeline Summary
+            logger.info("🤖 Generating Timeline Summary...")
+            timeline_content = generate_timeline_summary(timed_str)
+            if timeline_content:
+                timeline_url = upload_to_s3(timeline_content.encode('utf-8'), f"{Path(filename).stem}_timeline.txt", 'text/plain', f"files/user-{user_id}/summaries")
+
+        # 4. Update DB
+        update_lesson_success(lesson_id, series_id, transcript_url, summary_url, timeline_url)
+        logger.info(f"✅ Done! Summary: {'OK' if summary_url else 'Miss'}, Timeline: {'OK' if timeline_url else 'Miss'}")
         return True
         
     except Exception as e:
-        logger.error(f"❌ Job failed for lesson {lesson_id}: {str(e)}")
+        logger.error(f"❌ Job Failed: {e}")
         update_lesson_error(lesson_id, series_id, str(e))
         return False
-    
     finally:
-        # Cleanup temp file
-        if os.path.exists(video_path):
-            os.unlink(video_path)
-            logger.info(f"🗑️ Temp file deleted: {video_path}")
-
+        if os.path.exists(video_path): os.unlink(video_path)
 
 def main():
-    """Main worker loop"""
-    logger.info("=" * 60)
-    logger.info("🚀 Starting Transcript Worker")
-    logger.info("=" * 60)
-    
-    # Initialize Gemini
-    gemini_ready = init_gemini()
-    if not gemini_ready:
-        logger.warning("⚠️ Running without summary generation")
-    
-    # Pre-load Whisper model
-    logger.info("📦 Pre-loading Whisper model...")
+    logger.info("🚀 Worker Started (Robust Mode)")
+    init_gemini()
     get_whisper_model()
-    
-    logger.info("👂 Polling SQS for jobs... (Press Ctrl+C to stop)")
-    logger.info("")
-    
-    jobs_processed = 0
-    
     while True:
         try:
-            # Long polling - wait up to 20 seconds for message
             job = receive_transcript_job(wait_time=20)
-            
-            if job is None:
-                # No message, continue polling
-                continue
-            
-            logger.info("-" * 40)
-            logger.info(f"📥 Received job: {job['message_id']}")
-            
-            # Process job
-            success = process_job(job['body'])
-            
-            if success:
-                # Delete message from queue
-                delete_message(job['receipt_handle'])
-                jobs_processed += 1
-                logger.info(f"✅ Job completed successfully (Total: {jobs_processed})")
-            else:
-                # Don't delete - message will be retried after visibility timeout
-                logger.warning("⚠️ Job failed, will be retried")
-            
-            logger.info("-" * 40)
-            logger.info("")
-                
-        except KeyboardInterrupt:
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info(f"👋 Shutting down... (Processed {jobs_processed} jobs)")
-            logger.info("=" * 60)
-            break
-            
-        except Exception as e:
-            logger.error(f"❌ Worker error: {e}")
-            # Continue polling
-
+            if job:
+                if process_job(job['body']): delete_message(job['receipt_handle'])
+        except KeyboardInterrupt: break
+        except Exception as e: logger.error(f"Worker Error: {e}")
 
 if __name__ == '__main__':
     main()
