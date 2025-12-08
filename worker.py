@@ -114,19 +114,34 @@ def call_gemini_retry(prompt: str, max_retries=5, base_delay=10):
 
 def generate_overall_summary(transcript_text: str) -> str:
     prompt = f"""
-You are an expert summarizer. Create a HIGH-LEVEL EXECUTIVE SUMMARY.
+You are an expert educational content creator. Read the video transcript below and create a HIGH-QUALITY, EASY-TO-UNDERSTAND executive summary for learners. 
+Requirements:
+1. Use simple, clear, and engaging language suitable for beginners and non-experts.
+2. Preserve all main points, key concepts, and learning objectives in logical order.
+3. Include practical examples or real-world applications where possible.
+4. Explain technical terms or jargon if used, to ensure comprehension.
+5. Organize the summary into clear sections for readability.
+
 INPUT TRANSCRIPT:
 \"\"\"
 {transcript_text}
 \"\"\"
+
 OUTPUT FORMAT (Markdown):
 # Video Summary
-[2-3 paragraphs]
+[A structured 3-5 paragraph summary, covering all main points and logical flow, easy to follow for learners.]
+
+## Key Concepts
+- [List and briefly explain the most important concepts covered in the video]
+
+## Practical Applications / Examples
+- [Include relevant examples, use cases, or applications that help learners understand how to apply the concepts]
+
 ## Key Takeaways
-- [Point 1]
-- [Point 2]
+- [3-5 concise and actionable points summarizing the core insights, lessons, or skills learners should retain]
 """
     return call_gemini_retry(prompt)
+
 
 
 def generate_timeline_summary(transcript_with_timestamps: str) -> str:
