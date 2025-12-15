@@ -5,9 +5,10 @@ uvicorn
 aiofiles
 python-multipart
 pydantic
-torch
-faster-whisper
+# torch
+# faster-whisper
 numpy
 tqdm
 requests
 pymongo
+python-dotenv
