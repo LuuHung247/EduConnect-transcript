@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import router
 import logging
 from dotenv import load_dotenv
+import os
 load_dotenv() 
 
 logging.basicConfig(
@@ -19,10 +20,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware (điều chỉnh origins theo nhu cầu)
+# CORS middleware - configure from environment
+cors_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5173').split(',')
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Thay đổi trong production
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

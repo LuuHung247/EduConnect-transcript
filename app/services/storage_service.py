@@ -74,16 +74,10 @@ class StorageService:
         
         # Gửi job tới SQS (Worker sẽ xử lý)
         if create_transcript and lesson_id and series_id:
-            # Lưu video temp để worker đọc
-            temp_path = f"{TEMP_VIDEO_DIR}/{filename}"
-            with open(temp_path, 'wb') as f:
-                f.write(buffer)
-            
-            # Gửi job tới SQS
+            # Gửi job tới SQS với S3 key (worker sẽ download từ S3)
             job_sent = send_transcript_job({
-                "video_path": temp_path,
-                "video_url": url,
                 "video_key": video_key,
+                "video_url": url,
                 "user_id": user_id,
                 "lesson_id": lesson_id,
                 "series_id": series_id,

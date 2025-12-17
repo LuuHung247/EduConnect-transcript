@@ -109,14 +109,47 @@ def delete_from_s3(url_or_key: str) -> bool:
         return False
 
 
+def download_from_s3(key: str, local_path: str) -> bool:
+    """
+    Download object from S3 to local file
+
+    Args:
+        key: Object key in S3
+        local_path: Local file path to save downloaded content
+
+    Returns:
+        True if downloaded successfully, False otherwise
+    """
+    bucket = os.environ.get('AWS_S3_BUCKET')
+
+    if not bucket:
+        print("AWS_S3_BUCKET not configured")
+        return False
+
+    s3 = _get_s3_client()
+    if not s3:
+        return False
+
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        # Download file
+        s3.download_file(bucket, key, local_path)
+        return True
+    except ClientError as e:
+        print(f"Failed to download from S3: {e}")
+        return False
+
+
 def generate_presigned_url(key: str, expiration: int = 3600) -> Optional[str]:
     """
     Generate presigned URL for temporary access to private S3 object
-    
+
     Args:
         key: Object key in S3
         expiration: URL expiration time in seconds (default: 1 hour)
-    
+
     Returns:
         Presigned URL or None if failed
     """
@@ -125,11 +158,11 @@ def generate_presigned_url(key: str, expiration: int = 3600) -> Optional[str]:
     if not bucket:
         print("AWS_S3_BUCKET not configured")
         return None
-    
+
     s3 = _get_s3_client()
     if not s3:
         return None
-    
+
     try:
         url = s3.generate_presigned_url(
             'get_object',
