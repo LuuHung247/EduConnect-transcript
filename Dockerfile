@@ -31,8 +31,8 @@ RUN useradd -m -u 1000 appuser && \
 USER appuser
 
 # Expose port 8001 for Media Service
-EXPOSE 8001
+EXPOSE 8004
 
 # Run with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "4"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004", "--workers", "4"]
 
